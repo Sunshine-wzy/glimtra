@@ -56,13 +56,19 @@ pnpm desktop:build -- --locked
 
 已添加 Windows GitHub Actions 工作流：构建前端、检查 Rust 格式、运行 Rust 单元测试、生成 NSIS 安装包并上传构建产物。工作流只随代码提交运行，不会发布 GitHub Release。
 
-Rust 单元测试覆盖 UTF-8 在任意字节位置拆包、SSE 多行/未终止事件、超大/无效响应、输出截断、推理字段过滤、服务错误脱敏、URL 校验、设置原子覆盖。测试不需要真实 API Key，不访问真实模型。
+Rust 的 12 项测试覆盖 UTF-8 在任意字节位置拆包、SSE 多行/未终止事件、超大/无效响应、输出截断、推理字段过滤、服务错误脱敏、URL 校验、设置原子覆盖，以及通过本机模拟 HTTP 服务验证请求路径/认证/请求正文、流式及普通 JSON 响应、HTTP 401 和流中断。测试不需要真实 API Key，不访问真实模型。
 
 ### 当前验证状态
 
-已通过 TypeScript 检查、Vite 生产构建、Rust 格式检查，已检查浏览器预览的输入和导航。已生成前后端依赖锁文件。
+2026-10-19，本机安装 MSVC/Windows SDK 后已完成：
 
-本机尚缺少 MSVC/Windows SDK：`cargo check` 在依赖构建阶段报 `link.exe not found`。因此桌面后端编译、Rust 单元测试、安装包、自启动/快捷键/凭据库的实机验证尚未完成。没有使用真实模型密钥进行翻译请求，也没有测得桌面进程内存数据。
+- TypeScript 检查、Vite 生产构建、Rust 格式检查。
+- Rust 原生编译及全部 12 项测试（Windows 文件替换测试需在正常系统权限下运行；受限沙箱中会失败）。
+- 打包静态资源的桌面 Debug 版本启动、翻译页面和设置页面显示。
+- Windows x64 Release 编译及 NSIS 安装包生成：`src-tauri/target/release/bundle/nsis/Glimtra_0.1.0_x64-setup.exe`，1,915,859 字节（约 1.83 MiB）。Release 主程序 4,913,152 字节（约 4.69 MiB）。
+- Release 程序以 `--background` 冷启动后，进程树只有 1 个 Glimtra 进程，无 WebView2 子进程；本机单次采样私有工作集 2.16 MiB、总工作集 21.47 MiB。此结果只代表首次唤起前的后台状态，不能代表已打开翻译窗口后的占用。
+
+尚未验证安装/卸载完整流程、快捷键和托盘菜单交互、登录自启动、系统凭据库读写，以及窗口打开后的 Release 内存。桌面自动化在准备跨应用快捷键检查时因无法确认系统浏览器 URL 而停止。没有使用真实模型密钥调用模型。
 
 ## 轻量策略与边界
 

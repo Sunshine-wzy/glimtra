@@ -218,6 +218,177 @@ fn network_error(error: reqwest::Error) -> String {
 mod tests {
     use super::*;
 
+    fn mock_server(
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            time::Duration,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let response = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let read = connection.read(&mut buffer).unwrap();
+                assert!(read > 0, "client closed before sending its request");
+                request.extend_from_slice(&buffer[..read]);
+                assert!(request.len() < 128 * 1024);
+                if let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= header_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            connection.write_all(response.as_bytes()).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (endpoint, server)
+    }
+
+    fn request_fixture() -> TranslationRequest {
+        TranslationRequest {
+            id: "test-request".into(),
+            text: "Hello\n{user_name}".into(),
+            source_language: "en".into(),
+            target_language: "zh-CN".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn posts_to_configured_endpoint_and_streams_translation() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"🌿\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let (endpoint, server) = mock_server("200 OK", "text/event-stream; charset=utf-8", body);
+        let settings = Settings {
+            endpoint,
+            model: "test-model".into(),
+            ..Settings::default()
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut output = String::new();
+        run(
+            &client,
+            &settings,
+            Some("test-key"),
+            &request_fixture(),
+            |text| {
+                output.push_str(&text);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "你好🌿");
+        let wire = server.join().unwrap();
+        assert!(wire.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+        assert!(wire
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-key\r\n"));
+        let (_, body) = wire.split_once("\r\n\r\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][1]["content"], "Hello\n{user_name}");
+    }
+
+    #[tokio::test]
+    async fn accepts_non_streaming_compatible_provider() {
+        let (endpoint, server) = mock_server(
+            "200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"你好"},"finish_reason":"stop"}]}"#,
+        );
+        let settings = Settings {
+            endpoint,
+            model: "test-model".into(),
+            ..Settings::default()
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut output = String::new();
+        run(&client, &settings, None, &request_fixture(), |text| {
+            output.push_str(&text);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(output, "你好");
+        assert!(!server
+            .join()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn reports_authentication_failure_without_provider_body() {
+        let (endpoint, server) = mock_server(
+            "401 Unauthorized",
+            "application/json",
+            r#"{"error":{"message":"private-provider-response"}}"#,
+        );
+        let settings = Settings {
+            endpoint,
+            model: "test-model".into(),
+            ..Settings::default()
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = run(&client, &settings, None, &request_fixture(), |_| {
+            panic!("no translation expected")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("认证失败"));
+        assert!(!error.contains("private-provider-response"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_stream_disconnection_and_keeps_partial_translation() {
+        let (endpoint, server) = mock_server(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"部分译文\"}}]}\n\n",
+        );
+        let settings = Settings {
+            endpoint,
+            model: "test-model".into(),
+            ..Settings::default()
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut output = String::new();
+        let error = run(&client, &settings, None, &request_fixture(), |text| {
+            output.push_str(&text);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(output, "部分译文");
+        assert!(error.contains("不完整"));
+        server.join().unwrap();
+    }
+
     #[test]
     fn keeps_partial_text_but_reports_truncation() {
         let mut progress = Progress::default();
